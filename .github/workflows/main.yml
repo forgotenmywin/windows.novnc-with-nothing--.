@@ -1,7 +1,11 @@
-name: Windows 11 - RDP + noVNC + Cloudflare
 
-"on":
+name: Windows 11 - Mesa3D + RDP + noVNC + Cloudflare
+
+on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   windows-session:
@@ -11,29 +15,30 @@ jobs:
     steps:
 
       # ============================================================
-      # RDP
+      # 1. SETUP RDP
       # ============================================================
       - name: Configure RDP
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $Username = "runneradmin"
-          $Password = "WindowsRDP#2025"
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD GitHub Secret is missing."
+          }
 
-          Write-Host "============================================"
-          Write-Host "Configuring RDP"
-          Write-Host "============================================"
+          $Username = "runneradmin"
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
+            -Name fDenyTSConnections `
             -Value 0 `
             -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
+            -Name UserAuthentication `
             -Value 1 `
             -Force
 
@@ -42,7 +47,7 @@ jobs:
             -ErrorAction SilentlyContinue
 
           $SecurePassword = ConvertTo-SecureString `
-            $Password `
+            $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
 
@@ -64,31 +69,297 @@ jobs:
           }
 
           Add-LocalGroupMember `
-            -Group "Administrators" `
+            -Group Administrators `
             -Member $Username `
             -ErrorAction SilentlyContinue
 
           "RDP_USER=$Username" >> $env:GITHUB_ENV
-          "RDP_PASSWORD=$Password" >> $env:GITHUB_ENV
 
           Write-Host "RDP configured."
 
       # ============================================================
-      # INSTALL TIGHTVNC
+      # 2. DOWNLOAD AND INSTALL MESА3D
       # ============================================================
-      - name: Install TightVNC
+      - name: Download and Deploy Mesa3D
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
+          $Version = "26.3.0"
+          $Work = "C:\MesaInstall"
+          $Archive = "$Work\mesa.7z"
+          $Extract = "$Work\Extracted"
+          $Source = "$Work\mesa-source"
+
+          New-Item -ItemType Directory -Path $Work -Force | Out-Null
+          New-Item -ItemType Directory -Path $Extract -Force | Out-Null
+
           Write-Host "============================================"
-          Write-Host "Installing TightVNC"
+          Write-Host "Downloading Mesa3D $Version"
           Write-Host "============================================"
+
+          # --------------------------------------------------------
+          # GET OFFICIAL RELEASE INFORMATION
+          # --------------------------------------------------------
+
+          $ReleaseUrl = "https://api.github.com/repos/pal1000/mesa-dist-win/releases/tags/$Version"
+
+          $Release = Invoke-RestMethod `
+            -Uri $ReleaseUrl `
+            -Headers @{ "User-Agent" = "GitHubActions-MesaInstaller" }
+
+          $Asset = $Release.assets |
+            Where-Object {
+              $_.name -match "release-msvc.*\.7z$"
+            } |
+            Select-Object -First 1
+
+          if (!$Asset) {
+            throw "Official MSVC Mesa archive was not found in release $Version."
+          }
+
+          Write-Host "Asset: $($Asset.name)"
+          Write-Host "Download URL: $($Asset.browser_download_url)"
+
+          Invoke-WebRequest `
+            -Uri $Asset.browser_download_url `
+            -OutFile $Archive `
+            -UseBasicParsing
+
+          if (!(Test-Path $Archive)) {
+            throw "Mesa archive download failed."
+          }
+
+          $Size = (Get-Item $Archive).Length
+
+          if ($Size -lt 1000000) {
+            throw "Mesa archive is unexpectedly small: $Size bytes"
+          }
+
+          Write-Host "Mesa archive downloaded: $Size bytes"
+
+          # --------------------------------------------------------
+          # INSTALL 7-ZIP
+          # --------------------------------------------------------
+
+          $SevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
+
+          if (!$SevenZip) {
+            Write-Host "Installing 7-Zip..."
+
+            choco install 7zip -y --no-progress
+
+            $SevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
+          }
+
+          if (!$SevenZip) {
+            $Candidates = @(
+              "C:\Program Files\7-Zip\7z.exe",
+              "C:\Program Files (x86)\7-Zip\7z.exe"
+            )
+
+            foreach ($Candidate in $Candidates) {
+              if (Test-Path $Candidate) {
+                $SevenZipPath = $Candidate
+                break
+              }
+            }
+          }
+          else {
+            $SevenZipPath = $SevenZip.Source
+          }
+
+          if (!$SevenZipPath -or !(Test-Path $SevenZipPath)) {
+            throw "7-Zip executable not found."
+          }
+
+          # --------------------------------------------------------
+          # EXTRACT ARCHIVE
+          # --------------------------------------------------------
+
+          Write-Host "Extracting Mesa3D..."
+
+          & $SevenZipPath x $Archive "-o$Extract" -y
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Mesa extraction failed. Exit code: $LASTEXITCODE"
+          }
+
+          # --------------------------------------------------------
+          # LOCATE MESA ROOT
+          # --------------------------------------------------------
+
+          $Directories = @($Extract)
+
+          $Directories += Get-ChildItem `
+            -Path $Extract `
+            -Directory `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+
+          $MesaRoot = $null
+
+          foreach ($Directory in $Directories) {
+
+            $HasX64 = Test-Path "$Directory\x64"
+            $HasX86 = Test-Path "$Directory\x86"
+
+            $HasDriver = (
+              (Test-Path "$Directory\x64\opengl32.dll") -or
+              (Test-Path "$Directory\x64\libgallium_wgl.dll")
+            )
+
+            if ($HasX64 -and $HasX86 -and $HasDriver) {
+              $MesaRoot = $Directory
+              break
+            }
+          }
+
+          if (!$MesaRoot) {
+            throw "Could not locate Mesa x64/x86 driver folders."
+          }
+
+          Write-Host "Mesa root: $MesaRoot"
+
+          # --------------------------------------------------------
+          # GET OFFICIAL DEPLOYMENT SCRIPT AND MODULES
+          # --------------------------------------------------------
+
+          Write-Host "Downloading official deployment utility..."
+
+          git clone `
+            --depth 1 `
+            https://github.com/pal1000/mesa-dist-win.git `
+            $Source
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not clone official Mesa repository."
+          }
+
+          $DeploySource = "$Source\bin\systemwidedeploy.cmd"
+          $ModulesSource = "$Source\bin\modules"
+
+          if (!(Test-Path $DeploySource)) {
+            throw "Official systemwidedeploy.cmd was not found."
+          }
+
+          if (!(Test-Path "$ModulesSource\break.cmd")) {
+            throw "Required Mesa modules\break.cmd was not found."
+          }
+
+          if (!(Test-Path "$ModulesSource\prompt.cmd")) {
+            throw "Required Mesa modules\prompt.cmd was not found."
+          }
+
+          Copy-Item `
+            $DeploySource `
+            "$MesaRoot\systemwidedeploy.cmd" `
+            -Force
+
+          Copy-Item `
+            $ModulesSource `
+            "$MesaRoot\modules" `
+            -Recurse `
+            -Force
+
+          $DeployScript = "$MesaRoot\systemwidedeploy.cmd"
+
+          if (!(Test-Path $DeployScript)) {
+            throw "Deployment script copy failed."
+          }
+
+          # --------------------------------------------------------
+          # VERIFY REQUIRED FILES
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Mesa driver files:"
+
+          Get-ChildItem "$MesaRoot\x64" -Filter "*.dll" |
+            Select-Object -First 30 -ExpandProperty Name
+
+          $HasOpenGL = (
+            (Test-Path "$MesaRoot\x64\opengl32.dll") -or
+            (Test-Path "$MesaRoot\x64\libgallium_wgl.dll")
+          )
+
+          if (!$HasOpenGL) {
+            throw "Mesa x64 desktop OpenGL driver is missing."
+          }
+
+          # --------------------------------------------------------
+          # DEPLOY OPTION 1
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "Deploying Mesa Core Desktop OpenGL"
+          Write-Host "============================================"
+
+          $DeployProcess = Start-Process `
+            -FilePath $env:ComSpec `
+            -ArgumentList @(
+              "/d",
+              "/c",
+              "`"$DeployScript`" 1"
+            ) `
+            -WorkingDirectory $MesaRoot `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
+
+          Write-Host "Deployment exit code: $($DeployProcess.ExitCode)"
+
+          if ($DeployProcess.ExitCode -ne 0) {
+            throw "Mesa deployment failed."
+          }
+
+          # --------------------------------------------------------
+          # VERIFY SYSTEM-WIDE INSTALLATION
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Checking deployed driver..."
+
+          $SystemDriver = "$env:windir\System32\mesadrv.dll"
+
+          if (!(Test-Path $SystemDriver)) {
+            throw "System-wide Mesa driver was not installed."
+          }
+
+          Get-Item $SystemDriver |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-List
+
+          Write-Host "Mesa system-wide deployment completed."
+
+          # --------------------------------------------------------
+          # SAVE INSTALLATION PATH
+          # --------------------------------------------------------
+
+          "MESA_ROOT=$MesaRoot" >> $env:GITHUB_ENV
+          "MESA_DRIVER=$SystemDriver" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 3. INSTALL TIGHTVNC
+      # ============================================================
+      - name: Install TightVNC
+        shell: powershell
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            throw "VNC_PASSWORD GitHub Secret is missing."
+          }
+
+          if ($env:VNC_PASSWORD.Length -ne 8) {
+            throw "VNC_PASSWORD must contain exactly 8 characters."
+          }
 
           $Installer = "$env:TEMP\tightvnc.msi"
-
-          # Must be 8 characters or fewer for classic VNC authentication.
-          $VncPassword = "MyVNC123"
 
           Invoke-WebRequest `
             -Uri "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi" `
@@ -104,47 +375,37 @@ jobs:
             "`"$Installer`""
             "/quiet"
             "/norestart"
-
             "ADDLOCAL=Server"
-
             "SERVER_REGISTER_AS_SERVICE=1"
             "SERVER_ADD_FIREWALL_EXCEPTION=1"
-
             "SET_ACCEPTRFBCONNECTIONS=1"
             "VALUE_OF_ACCEPTRFBCONNECTIONS=1"
-
             "SET_USEVNCAUTHENTICATION=1"
             "VALUE_OF_USEVNCAUTHENTICATION=1"
-
             "SET_PASSWORD=1"
-            "VALUE_OF_PASSWORD=$VncPassword"
+            "VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
           )
 
           $Process = Start-Process `
-            -FilePath "msiexec.exe" `
+            -FilePath msiexec.exe `
             -ArgumentList $Arguments `
             -Wait `
             -PassThru `
             -NoNewWindow
 
           if ($Process.ExitCode -ne 0) {
-            throw "TightVNC installation failed. Exit code: $($Process.ExitCode)"
+            throw "TightVNC installation failed: $($Process.ExitCode)"
           }
 
           Write-Host "TightVNC installed."
 
       # ============================================================
-      # START TIGHTVNC
-      # ONLY CHANGE LOOPBACK
+      # 4. CONFIGURE AND START TIGHTVNC
       # ============================================================
-      - name: Start TightVNC
+      - name: Configure TightVNC
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-
-          Write-Host "============================================"
-          Write-Host "Configuring TightVNC"
-          Write-Host "============================================"
 
           $VncExe = "C:\Program Files\TightVNC\tvnserver.exe"
           $RegPath = "HKLM:\SOFTWARE\TightVNC\Server"
@@ -157,91 +418,59 @@ jobs:
             throw "TightVNC registry key not found."
           }
 
-          # ----------------------------------------------------------
-          # IMPORTANT:
-          # Do NOT overwrite Password here.
-          # MSI already configured the correct password.
-          # ----------------------------------------------------------
-
           New-ItemProperty `
             -Path $RegPath `
-            -Name "AcceptRfbConnections" `
+            -Name AcceptRfbConnections `
             -PropertyType DWord `
             -Value 1 `
             -Force | Out-Null
 
           New-ItemProperty `
             -Path $RegPath `
-            -Name "RfbPort" `
+            -Name RfbPort `
             -PropertyType DWord `
             -Value 5900 `
             -Force | Out-Null
 
           New-ItemProperty `
             -Path $RegPath `
-            -Name "UseVncAuthentication" `
+            -Name UseVncAuthentication `
             -PropertyType DWord `
             -Value 1 `
             -Force | Out-Null
 
           New-ItemProperty `
             -Path $RegPath `
-            -Name "UseControlAuthentication" `
+            -Name UseControlAuthentication `
             -PropertyType DWord `
             -Value 0 `
             -Force | Out-Null
 
-          # ----------------------------------------------------------
-          # FIX FOR:
-          # "Sorry, loopback connections are not enabled"
-          # ----------------------------------------------------------
-
           New-ItemProperty `
             -Path $RegPath `
-            -Name "AllowLoopback" `
+            -Name AllowLoopback `
             -PropertyType DWord `
             -Value 1 `
             -Force | Out-Null
 
           New-ItemProperty `
             -Path $RegPath `
-            -Name "LoopbackOnly" `
+            -Name LoopbackOnly `
             -PropertyType DWord `
             -Value 0 `
             -Force | Out-Null
 
-          # ----------------------------------------------------------
-          # Verify MSI-created password exists
-          # ----------------------------------------------------------
-
-          $Config = Get-ItemProperty `
-            -Path $RegPath
+          $Config = Get-ItemProperty -Path $RegPath
 
           if ($null -eq $Config.Password) {
-            throw "TightVNC password was not created by the MSI installer."
+            throw "TightVNC password was not created."
           }
 
           if ($Config.Password.Length -ne 8) {
-            throw "TightVNC password registry value is invalid. Length: $($Config.Password.Length)"
+            throw "TightVNC password registry value is invalid."
           }
 
-          Write-Host ""
-          Write-Host "TightVNC configuration:"
-          Write-Host "AcceptRfbConnections      = $($Config.AcceptRfbConnections)"
-          Write-Host "RfbPort                   = $($Config.RfbPort)"
-          Write-Host "UseVncAuthentication      = $($Config.UseVncAuthentication)"
-          Write-Host "UseControlAuthentication = $($Config.UseControlAuthentication)"
-          Write-Host "AllowLoopback             = $($Config.AllowLoopback)"
-          Write-Host "LoopbackOnly              = $($Config.LoopbackOnly)"
-          Write-Host "Password registry         = OK"
-          Write-Host "Password bytes            = $($Config.Password.Length)"
-
-          # ----------------------------------------------------------
-          # Restart TightVNC so all settings are loaded
-          # ----------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "Restarting TightVNC..."
+          Write-Host "TightVNC settings verified."
 
           & $VncExe -stop -silent 2>$null
 
@@ -252,91 +481,70 @@ jobs:
           Start-Sleep -Seconds 5
 
           $Service = Get-Service `
-            -Name "tvnserver" `
+            -Name tvnserver `
             -ErrorAction SilentlyContinue
 
           if ($Service -and $Service.Status -ne "Running") {
-
-            Start-Service `
-              -Name "tvnserver" `
-              -ErrorAction SilentlyContinue
-
-            Start-Sleep -Seconds 3
+            Start-Service tvnserver
           }
 
-          Write-Host ""
-          Write-Host "TightVNC Service:"
-          Get-Service `
-            -Name "tvnserver" `
-            -ErrorAction SilentlyContinue |
+          Get-Service tvnserver |
             Format-Table -AutoSize
 
       # ============================================================
-      # VERIFY VNC
+      # 5. VERIFY VNC
       # ============================================================
       - name: Verify VNC
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "============================================"
-          Write-Host "Checking VNC port 5900"
-          Write-Host "============================================"
-
           $Ready = $false
 
           for ($i = 1; $i -le 30; $i++) {
 
             $Result = Test-NetConnection `
-              -ComputerName "127.0.0.1" `
+              -ComputerName 127.0.0.1 `
               -Port 5900 `
               -WarningAction SilentlyContinue
 
             if ($Result.TcpTestSucceeded) {
-
-              Write-Host ""
-              Write-Host "============================================"
-              Write-Host "VNC is listening on 127.0.0.1:5900"
-              Write-Host "============================================"
-
               $Ready = $true
               break
             }
 
             Write-Host "Waiting for VNC... $i/30"
-
             Start-Sleep -Seconds 2
           }
 
           if (!$Ready) {
-            throw "VNC server is not listening on port 5900."
+            throw "VNC is not listening on port 5900."
           }
 
+          Write-Host "VNC is ready."
+
       # ============================================================
-      # INSTALL NOVNC
+      # 6. INSTALL NOVNC
       # ============================================================
       - name: Install noVNC
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "============================================"
-          Write-Host "Installing noVNC"
-          Write-Host "============================================"
-
           $NoVncPath = "C:\noVNC"
 
           if (Test-Path $NoVncPath) {
-            Remove-Item `
-              $NoVncPath `
-              -Recurse `
-              -Force
+            Remove-Item $NoVncPath -Recurse -Force
           }
 
           git clone `
             --depth 1 `
             https://github.com/novnc/noVNC.git `
             $NoVncPath
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "noVNC clone failed."
+          }
 
           if (!(Test-Path "$NoVncPath\vnc.html")) {
             throw "noVNC installation failed."
@@ -345,85 +553,32 @@ jobs:
           Write-Host "noVNC installed."
 
       # ============================================================
-      # INSTALL WEBSOCKIFY
+      # 7. INSTALL PYTHON AND WEBSOCKIFY
       # ============================================================
+      - name: Install Python and websockify
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install websockify
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "============================================"
-          Write-Host "Installing websockify"
-          Write-Host "============================================"
+          python -m pip install --upgrade pip
+          python -m pip install websockify
 
-          $Python = Get-Command `
-            python.exe `
-            -ErrorAction SilentlyContinue
+          python -m websockify --version
 
-          if (!$Python) {
-
-            Write-Host "Python not found. Installing Python 3.12..."
-
-            winget install `
-              --id Python.Python.3.12 `
-              --exact `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
-
-            Start-Sleep -Seconds 5
-          }
-
-          $Python = Get-Command `
-            python.exe `
-            -ErrorAction SilentlyContinue
-
-          if (!$Python) {
-            throw "Python was not found."
-          }
-
-          $PythonPath = $Python.Source
-
-          Write-Host "Python:"
-          & $PythonPath --version
-
-          & $PythonPath -m pip install --upgrade pip
-
-          & $PythonPath -m pip install websockify
-
-          $PythonDir = Split-Path $PythonPath
-          $Scripts = Join-Path $PythonDir "Scripts"
-          $Websockify = Join-Path $Scripts "websockify.exe"
-
-          if (!(Test-Path $Websockify)) {
-
-            $Command = Get-Command `
-              websockify.exe `
-              -ErrorAction SilentlyContinue
-
-            if (!$Command) {
-              throw "websockify.exe was not found."
-            }
-
-            $Websockify = $Command.Source
-          }
-
-          Write-Host "websockify:"
-          Write-Host $Websockify
-
-          "WEBSOCKIFY_EXE=$Websockify" >> $env:GITHUB_ENV
+          Write-Host "websockify installed."
 
       # ============================================================
-      # INSTALL CLOUDFLARED
+      # 8. INSTALL CLOUDFLARED
       # ============================================================
       - name: Install cloudflared
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-
-          Write-Host "============================================"
-          Write-Host "Installing cloudflared"
-          Write-Host "============================================"
 
           $Cloudflared = "C:\cloudflared.exe"
 
@@ -438,21 +593,23 @@ jobs:
 
           & $Cloudflared version
 
+          "CLOUDFLARED_EXE=$Cloudflared" >> $env:GITHUB_ENV
+
       # ============================================================
-      # START NOVNC + CLOUDFLARE
-      # SAME STEP = IMPORTANT
+      # 9. START NOVNC + CLOUDFLARE
       # ============================================================
       - name: Start noVNC + Cloudflare and Keep Alive
         shell: powershell
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $NoVncPath = "C:\noVNC"
-          $Websockify = $env:WEBSOCKIFY_EXE
-          $Cloudflared = "C:\cloudflared.exe"
+          $Cloudflared = $env:CLOUDFLARED_EXE
 
           $VncTarget = "127.0.0.1:5900"
-
           $WebPort = 6080
           $Origin = "http://127.0.0.1:6080"
 
@@ -461,12 +618,7 @@ jobs:
 
           $CfStdout = "C:\cloudflared-stdout.log"
           $CfStderr = "C:\cloudflared-stderr.log"
-
           $CfDebug = "C:\cloudflared-debug.log"
-
-          # ==========================================================
-          # CLEAN LOGS
-          # ==========================================================
 
           Remove-Item `
             $WebStdout,
@@ -477,18 +629,17 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
-          # ==========================================================
+          # --------------------------------------------------------
           # START WEBSOCKIFY
-          # ==========================================================
+          # --------------------------------------------------------
 
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "Starting noVNC / websockify"
-          Write-Host "============================================"
+          Write-Host "Starting websockify..."
 
           $WebProcess = Start-Process `
-            -FilePath $Websockify `
+            -FilePath "python.exe" `
             -ArgumentList @(
+              "-m",
+              "websockify",
               "--web",
               $NoVncPath,
               "--verbose",
@@ -503,9 +654,9 @@ jobs:
 
           Write-Host "websockify PID: $($WebProcess.Id)"
 
-          # ==========================================================
-          # WAIT FOR NOVNC
-          # ==========================================================
+          # --------------------------------------------------------
+          # WAIT FOR LOCAL NOVNC
+          # --------------------------------------------------------
 
           $LocalReady = $false
 
@@ -514,46 +665,29 @@ jobs:
             Start-Sleep -Seconds 2
 
             if ($WebProcess.HasExited) {
-
-              Write-Host "websockify exited unexpectedly."
-
-              Get-Content `
-                $WebStdout `
-                -ErrorAction SilentlyContinue
-
-              Get-Content `
-                $WebStderr `
-                -ErrorAction SilentlyContinue
-
-              throw "websockify exited before port 6080 became ready."
+              Get-Content $WebStderr -ErrorAction SilentlyContinue
+              throw "websockify exited unexpectedly."
             }
 
             $Tcp = Test-NetConnection `
-              -ComputerName "127.0.0.1" `
+              -ComputerName 127.0.0.1 `
               -Port $WebPort `
               -WarningAction SilentlyContinue
 
             if ($Tcp.TcpTestSucceeded) {
 
               try {
-
                 $Response = Invoke-WebRequest `
                   -Uri "http://127.0.0.1:6080/vnc.html" `
                   -UseBasicParsing `
                   -TimeoutSec 10
 
                 if ($Response.StatusCode -eq 200) {
-
                   $LocalReady = $true
-
-                  Write-Host ""
-                  Write-Host "Local noVNC HTTP: 200"
-
                   break
                 }
               }
               catch {
-
                 Write-Host "Waiting for HTTP..."
               }
             }
@@ -562,26 +696,18 @@ jobs:
           }
 
           if (!$LocalReady) {
-
-            Get-Content `
-              $WebStdout `
-              -ErrorAction SilentlyContinue
-
-            Get-Content `
-              $WebStderr `
-              -ErrorAction SilentlyContinue
-
+            Get-Content $WebStdout -ErrorAction SilentlyContinue
+            Get-Content $WebStderr -ErrorAction SilentlyContinue
             throw "Local noVNC did not become ready."
           }
 
-          # ==========================================================
-          # START CLOUDFLARE
-          # ==========================================================
+          Write-Host "Local noVNC HTTP: 200"
 
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "Starting Cloudflare Quick Tunnel"
-          Write-Host "============================================"
+          # --------------------------------------------------------
+          # START CLOUDFLARE QUICK TUNNEL
+          # --------------------------------------------------------
+
+          Write-Host "Starting Cloudflare Quick Tunnel..."
 
           $CfProcess = Start-Process `
             -FilePath $Cloudflared `
@@ -606,9 +732,9 @@ jobs:
 
           Write-Host "cloudflared PID: $($CfProcess.Id)"
 
-          # ==========================================================
-          # WAIT FOR CLOUDFLARE
-          # ==========================================================
+          # --------------------------------------------------------
+          # WAIT FOR TUNNEL
+          # --------------------------------------------------------
 
           $TunnelUrl = $null
           $Registered = $false
@@ -618,55 +744,21 @@ jobs:
             Start-Sleep -Seconds 2
 
             if ($CfProcess.HasExited) {
-
-              Write-Host "cloudflared exited unexpectedly."
-
-              Get-Content `
-                $CfStdout `
-                -ErrorAction SilentlyContinue
-
-              Get-Content `
-                $CfStderr `
-                -ErrorAction SilentlyContinue
-
-              throw "cloudflared exited before the tunnel was registered."
+              Get-Content $CfDebug -Tail 100 -ErrorAction SilentlyContinue
+              throw "cloudflared exited unexpectedly."
             }
 
             $Content = ""
 
-            if (Test-Path $CfStdout) {
-              $Content += "`n" + (
-                Get-Content `
-                  $CfStdout `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
+            foreach ($Log in @($CfStdout, $CfStderr, $CfDebug)) {
+              if (Test-Path $Log) {
+                $Content += "`n" + (
+                  Get-Content $Log -Raw -ErrorAction SilentlyContinue
+                )
+              }
             }
-
-            if (Test-Path $CfStderr) {
-              $Content += "`n" + (
-                Get-Content `
-                  $CfStderr `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
-            }
-
-            if (Test-Path $CfDebug) {
-              $Content += "`n" + (
-                Get-Content `
-                  $CfDebug `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
-            }
-
-            # --------------------------------------------------------
-            # FIND QUICK TUNNEL URL
-            # --------------------------------------------------------
 
             if (!$TunnelUrl) {
-
               $Match = [regex]::Match(
                 $Content,
                 'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
@@ -677,10 +769,6 @@ jobs:
               }
             }
 
-            # --------------------------------------------------------
-            # CHECK REGISTERED CONNECTION
-            # --------------------------------------------------------
-
             if ($Content -match "Registered tunnel connection") {
               $Registered = $true
             }
@@ -690,10 +778,7 @@ jobs:
             }
 
             if ($Registered) {
-
-              Write-Host ""
               Write-Host "Cloudflare tunnel registered."
-
               break
             }
 
@@ -701,33 +786,22 @@ jobs:
           }
 
           if (!$TunnelUrl) {
-
-            Get-Content `
-              $CfDebug `
-              -Tail 200 `
-              -ErrorAction SilentlyContinue
-
+            Get-Content $CfDebug -Tail 200 -ErrorAction SilentlyContinue
             throw "Cloudflare did not create a Quick Tunnel URL."
           }
 
           if (!$Registered) {
-
-            Get-Content `
-              $CfDebug `
-              -Tail 200 `
-              -ErrorAction SilentlyContinue
-
+            Get-Content $CfDebug -Tail 200 -ErrorAction SilentlyContinue
             throw "Cloudflare tunnel was not registered."
           }
 
-          # ==========================================================
-          # PUBLIC URL
-          # ==========================================================
+          # --------------------------------------------------------
+          # TEST PUBLIC URL
+          # --------------------------------------------------------
 
           $NoVncUrl = "$TunnelUrl/vnc.html"
 
-          Write-Host ""
-          Write-Host "Waiting for public HTTP..."
+          Write-Host "Testing public noVNC..."
 
           Start-Sleep -Seconds 10
 
@@ -735,95 +809,64 @@ jobs:
 
           for ($i = 1; $i -le 20; $i++) {
 
-            if ($WebProcess.HasExited) {
-              throw "websockify died while Cloudflare was starting."
-            }
-
-            if ($CfProcess.HasExited) {
-              throw "cloudflared died."
+            if ($WebProcess.HasExited -or $CfProcess.HasExited) {
+              throw "A required process stopped."
             }
 
             try {
-
               $Response = Invoke-WebRequest `
                 -Uri $NoVncUrl `
                 -UseBasicParsing `
                 -TimeoutSec 15
 
-              Write-Host "Public HTTP status: $($Response.StatusCode)"
+              Write-Host "Public HTTP: $($Response.StatusCode)"
 
               if ($Response.StatusCode -eq 200) {
-
                 $PublicReady = $true
-
                 break
               }
             }
             catch {
-
-              Write-Host "Public HTTP failed: $($_.Exception.Message)"
+              Write-Host "Public HTTP retry: $($_.Exception.Message)"
             }
 
             Start-Sleep -Seconds 3
           }
 
-          # ==========================================================
-          # CONNECTION INFO
-          # ==========================================================
+          # --------------------------------------------------------
+          # CONNECTION INFORMATION
+          # --------------------------------------------------------
 
           Write-Host ""
-          Write-Host ""
           Write-Host "============================================================"
-          Write-Host "                     noVNC READY"
+          Write-Host "                    WINDOWS READY"
           Write-Host "============================================================"
           Write-Host ""
 
-          Write-Host "URL:"
+          Write-Host "noVNC URL:"
           Write-Host $NoVncUrl
 
           Write-Host ""
-
-          Write-Host "VNC PASSWORD:"
-          Write-Host "MyVNC123"
-
-          Write-Host ""
-
-          Write-Host "RDP USER:"
-          Write-Host "runneradmin"
+          Write-Host "VNC username: Not required"
+          Write-Host "VNC password: GitHub Secret VNC_PASSWORD"
 
           Write-Host ""
-
-          Write-Host "RDP PASSWORD:"
-          Write-Host "WindowsRDP#2025"
+          Write-Host "RDP username: runneradmin"
+          Write-Host "RDP password: GitHub Secret RDP_PASSWORD"
 
           Write-Host ""
+          Write-Host "Mesa driver:"
+          Write-Host $env:MESA_DRIVER
 
+          Write-Host ""
+          Write-Host "Public HTTP test: $PublicReady"
+
+          Write-Host ""
           Write-Host "============================================================"
-          Write-Host ""
 
-          if (!$PublicReady) {
-
-            Write-Host "Public HTTP test did not return 200."
-
-            Get-Content `
-              $CfDebug `
-              -Tail 200 `
-              -ErrorAction SilentlyContinue
-
-            Get-Content `
-              $WebStdout `
-              -Tail 100 `
-              -ErrorAction SilentlyContinue
-
-            Get-Content `
-              $WebStderr `
-              -Tail 100 `
-              -ErrorAction SilentlyContinue
-          }
-
-          # ==========================================================
+          # --------------------------------------------------------
           # KEEP EVERYTHING ALIVE
-          # ==========================================================
+          # --------------------------------------------------------
 
           while ($true) {
 
@@ -832,33 +875,22 @@ jobs:
             $Now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
             if ($WebProcess.HasExited) {
-
-              Write-Host "websockify stopped."
-
-              Get-Content `
-                $WebStdout `
-                -Tail 100 `
-                -ErrorAction SilentlyContinue
-
-              Get-Content `
-                $WebStderr `
-                -Tail 100 `
-                -ErrorAction SilentlyContinue
-
+              Get-Content $WebStderr -Tail 100 -ErrorAction SilentlyContinue
               throw "websockify stopped."
             }
 
             if ($CfProcess.HasExited) {
-
-              Write-Host "cloudflared stopped."
-
-              Get-Content `
-                $CfDebug `
-                -Tail 200 `
-                -ErrorAction SilentlyContinue
-
+              Get-Content $CfDebug -Tail 200 -ErrorAction SilentlyContinue
               throw "cloudflared stopped."
             }
 
-            Write-Host "[$Now] Windows + TightVNC + noVNC + Cloudflare alive."
+            $VncService = Get-Service `
+              -Name tvnserver `
+              -ErrorAction SilentlyContinue
+
+            if (!$VncService -or $VncService.Status -ne "Running") {
+              throw "TightVNC service stopped."
+            }
+
+            Write-Host "[$Now] Windows + Mesa + VNC + noVNC + Cloudflare alive."
           }
